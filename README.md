@@ -1,3 +1,5 @@
-# security.lightwell
+# Ansible Collection - security.lightwell
 
-Collection to automate Lightwell repositories with Ansible
+A collection to automate Lightwell from [IBM](https://ibm.com/lightwell) and [Red Hat](https://redhat.com/lightwell).
+
+For now there is a playbook to identify newly added OSV files: [security.lightwell.osv_get](docs/osv_get.md).

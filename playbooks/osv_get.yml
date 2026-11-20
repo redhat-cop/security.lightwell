@@ -1,0 +1,200 @@
+---
+# export LIGHTWELL_USER='org-id|account' LIGHTWELL_TOKEN='token'
+# ansible-playbook security.lightwell.osv_get -e lightwell_tech_osv=java
+# ansible-playbook security.lightwell.osv_get -e lightwell_tech_osv=python
+# ansible-playbook security.lightwell.osv_get --list-tasks
+# A missing <tech>/PULP_MANIFEST.ref is copied from <tech>/PULP_MANIFEST
+- name: "Check {{ lightwell_tech_osv }} OSV files from Lightwell"
+  hosts: localhost
+  gather_facts: false
+  become: false
+  vars:
+    # Credentials are read from the environment. Do not store them in this file.
+    lightwell_user: "{{ lookup('ansible.builtin.env', 'LIGHTWELL_USER') }}"
+    lightwell_token: "{{ lookup('ansible.builtin.env', 'LIGHTWELL_TOKEN') }}"
+    lightwell_pulp_base_url: "https://packages.redhat.com/api/pulp-content/lightwell"
+    lightwell_tech_osv: java  # or python
+    lightwell_type_osv: remediated  # or predisclosure
+    lightwell_osv_url: "{{ lightwell_pulp_base_url }}/osv/{{ lightwell_tech_osv }}/{{ lightwell_type_osv }}"
+    lightwell_osv_manifest_url: "{{ lightwell_osv_url }}/PULP_MANIFEST"
+      # Current directory under Linux resp. Windows, because dot doesn't work
+    lightwell_base_osv_dir: "{{ lookup('ansible.builtin.env', 'PWD') | default(lookup('ansible.builtin.env', 'CD'), true) }}"
+    lightwell_osv_dir: "{{ lightwell_base_osv_dir }}/{{ lightwell_tech_osv }}/{{ lightwell_type_osv }}"
+    lightwell_osv_manifest_file: "{{ lightwell_osv_dir }}/PULP_MANIFEST"
+    lightwell_osv_manifest_ref: "{{ lightwell_osv_dir }}/PULP_MANIFEST.ref"
+    lightwell_manifest_force: false  # Set to true to avoid getting a 304
+  tasks:
+    - name: Require Lightwell credentials from the environment
+      ansible.builtin.assert:
+        that:
+          - lightwell_user | length > 0
+          - lightwell_token | length > 0
+        fail_msg: >-
+          Set LIGHTWELL_USER and LIGHTWELL_TOKEN in the environment before
+          running this playbook. See README.md.
+
+    - name: Require a supported OSV technology
+      ansible.builtin.assert:
+        that:
+          - lightwell_tech_osv in ['java', 'python', 'javascript']
+        fail_msg: >-
+          Set lightwell_tech_osv to java or python (or soon javascript).
+          Example: ansible-playbook security.lightwell.osv_get -e lightwell_tech_osv=python
+
+    - name: Require a supported OSV type
+      ansible.builtin.assert:
+        that:
+          - lightwell_type_osv in ['remediated', 'predisclosure']
+        fail_msg: >-
+          Set lightwell_type_osv to remediated or predisclosure.
+          Example: ansible-playbook security.lightwell.osv_get -e lightwell_type_osv=python
+
+    - name: Create the local directory for this technology
+      ansible.builtin.file:
+        path: "{{ lightwell_osv_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download OSV's Pulp Manifest
+      ansible.builtin.uri:
+        method: GET
+        url: "{{ lightwell_osv_manifest_url }}"
+        user: "{{ lightwell_user }}"
+        password: "{{ lightwell_token }}"
+        dest: "{{ lightwell_osv_manifest_file }}"
+        status_code: [200, 304]
+        force: "{{ lightwell_manifest_force }}"
+      register: __lightwell_result
+
+    - ansible.builtin.debug:
+        var: __lightwell_result
+        verbosity: 1
+
+    - name: Copy the manifest into the reference when the reference is missing
+      ansible.builtin.copy:
+        src: "{{ lightwell_osv_manifest_file }}"
+        dest: "{{ lightwell_osv_manifest_ref }}"
+        remote_src: true
+        force: false
+
+    - name: Finish the play in case of HTTP 304 not changed
+      ansible.builtin.meta: end_play
+      when:
+        - __lightwell_result.status == 304
+        - not lightwell_manifest_force
+
+    - name: Read CSV from Pulp Manifest
+      community.general.read_csv:
+        fieldnames: [file, hash, size]
+        path: "{{ lightwell_osv_manifest_file }}"
+        key: file
+        unique: true
+      register: __lightwell_manifest
+
+    - ansible.builtin.debug:
+        var: __lightwell_manifest.dict
+        verbosity: 2
+
+    - name: Read CSV from Pulp Manifest reference
+      community.general.read_csv:
+        fieldnames: [file, hash, size]
+        path: "{{ lightwell_osv_manifest_ref }}"
+        key: file
+        unique: true
+      register: __lightwell_manifest_ref
+
+    - ansible.builtin.debug:
+        var: __lightwell_manifest_ref.dict
+        verbosity: 2
+
+    - name: Get the difference between reference and new version
+      ansible.builtin.set_fact:
+        __lightwell_new: "{{ __lightwell_manifest.dict.keys() | difference(__lightwell_manifest_ref.dict.keys()) }}"
+
+    - ansible.builtin.debug:
+        var: __lightwell_new
+        verbosity: 1
+
+    - name: Gather information from new OSV files
+      ansible.builtin.uri:
+        method: GET
+        url: "{{ lightwell_osv_url }}/{{ item }}"
+        user: "{{ lightwell_user }}"
+        password: "{{ lightwell_token }}"
+        force: true  # To avoid getting a 304
+      register: __lightwell_new_osv_files
+      loop: "{{ __lightwell_new }}"
+
+    - name: Inform user if there is something to be fixed
+      ansible.builtin.debug:
+        msg: >-
+          New OSV file '{{ item.item }}' contains a vulnerability
+          of severity '{{ item.json.severity.0.score | default('unknown') }}'
+          concerning the {{ item.json.affected.0.package.ecosystem }}
+          package '{{ item.json.affected.0.package.name }}', fixed in version
+          '{{ item.json.affected.0.ranges.0.events.1.fixed }}'.
+          {% if item.json.published == item.json.modified %}
+          Published: {{ item.json.published }}.
+          {% else %}
+          Published: {{ item.json.published }}, Modified: {{ item.json.modified }}.
+          {% endif %}
+          Someone should do something about it...
+      loop: "{{ __lightwell_new_osv_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Get the intersection between reference and new version
+      ansible.builtin.set_fact:
+        __lightwell_same_yaml: >-
+          {% set diff_list = [] %}
+          {% for k in __lightwell_manifest.dict.keys() | intersect(__lightwell_manifest_ref.dict.keys()) %}
+          {% if __lightwell_manifest.dict[k]['hash'] != __lightwell_manifest_ref.dict[k]['hash'] %}
+          {{ diff_list.append(k) }}
+          {% endif %}
+          {% endfor %}
+          {{ diff_list }}
+
+    - name: Transform string into list variable
+      ansible.builtin.set_fact:
+        __lightwell_same: "{{ __lightwell_same_yaml | from_yaml }}"
+
+    - ansible.builtin.debug:
+        var: __lightwell_same
+        verbosity: 1
+
+    - name: Gather information from modified OSV files
+      ansible.builtin.uri:
+        method: GET
+        url: "{{ lightwell_osv_url }}/{{ item }}"
+        user: "{{ lightwell_user }}"
+        password: "{{ lightwell_token }}"
+        force: true  # To avoid getting a 304
+      register: __lightwell_changed_osv_files
+      loop: "{{ __lightwell_same }}"
+      when: __lightwell_manifest.dict[item] != __lightwell_manifest_ref.dict[item]
+
+    - name: Inform user if there is something modified
+      ansible.builtin.debug:
+        msg: >-
+          Modified OSV file '{{ item.item }}' contains a vulnerability
+          of severity '{{ item.json.severity.0.score | default('unknown') }}'
+          concerning the {{ item.json.affected.0.package.ecosystem }}
+          package '{{ item.json.affected.0.package.name }}', fixed in version
+          '{{ item.json.affected.0.ranges.0.events.1.fixed }}'.
+          {% if item.json.published == item.json.modified %}
+          Published: {{ item.json.published }}.
+          {% else %}
+          Published: {{ item.json.published }}, Modified: {{ item.json.modified }}.
+          {% endif %}
+          Someone should look into it...
+      loop: "{{ __lightwell_changed_osv_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.skipped is not defined or not item.skipped
+
+    - name: "Once done, overwrite the old reference with the new manifest"
+      ansible.builtin.copy:
+        src: "{{ lightwell_osv_manifest_file }}"
+        dest: "{{ lightwell_osv_manifest_ref }}"
+        backup: true
+        remote_src: true
